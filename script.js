@@ -688,7 +688,8 @@ function renderResults() {
   }
 
   if (activeEntry.status === "processing") {
-    renderResultMessage("Analyzing this image...");
+    const modelText = activeEntry.processingModelLabel ? ` with ${activeEntry.processingModelLabel}` : "";
+    renderResultMessage(`Analyzing this image${modelText}...`);
     return;
   }
 
@@ -1117,6 +1118,11 @@ function getSelectedModelConfig() {
   return GEMINI_MODELS[getSelectedModelChoice()] || GEMINI_MODELS.flash;
 }
 
+function getModelLabelByApiModel(apiModel) {
+  const config = Object.values(GEMINI_MODELS).find((modelConfig) => modelConfig.apiModel === apiModel);
+  return config?.label || apiModel;
+}
+
 function setSelectedModelChoice(choice) {
   const nextChoice = Object.hasOwn(GEMINI_MODELS, choice) ? choice : "flash";
   localStorage.setItem(MODEL_STORAGE_KEY, nextChoice);
@@ -1138,6 +1144,8 @@ function toggleKeyModalModelChoice(event) {
   const currentChoice = getKeyModalModelChoice();
   const nextChoice = currentChoice === "flash" ? "lite" : "flash";
   setKeyModalModelChoice(nextChoice);
+  setSelectedModelChoice(nextChoice);
+  updateApiKeyState();
 }
 
 function setKeyModalModelChoice(choice) {
@@ -1204,6 +1212,7 @@ async function analyzeImages({ entries, forceCompress }) {
       entry.results = [];
       entry.error = "";
       entry.status = "idle";
+      entry.processingModelLabel = "";
     });
     updateFlatResults();
     renderResults();
@@ -1216,13 +1225,15 @@ async function analyzeImages({ entries, forceCompress }) {
 
     for (let index = 0; index < entriesToSend.length; index += 1) {
       const entry = entriesToSend[index];
+      const modelLabel = getModelLabelByApiModel(activeModel);
       state.activeImageId = entry.id;
       entry.status = "processing";
       entry.error = "";
+      entry.processingModelLabel = modelLabel;
       renderFiles();
       renderResults();
 
-      const label = totalImages === 1 ? `Analyzing ${entry.name}...` : `Analyzing image ${index + 1} of ${totalImages}...`;
+      const label = totalImages === 1 ? `Analyzing ${entry.name} with ${modelLabel}...` : `Analyzing image ${index + 1} of ${totalImages} with ${modelLabel}...`;
       setStatus(label);
       updateProgress(index / totalImages);
 
@@ -1300,9 +1311,14 @@ async function applyLiteForRun(entry, error) {
     return { applied: false, success: false };
   }
 
+  setSelectedModelChoice("lite");
+  setKeyModalModelChoice("lite");
+  updateApiKeyState();
+
   entry.status = "processing";
   entry.error = "";
-  setStatus(`Retrying ${entry.name} with Lite...`);
+  entry.processingModelLabel = getModelLabelByApiModel(FALLBACK_MODEL);
+  setStatus(`Retrying ${entry.name} with ${entry.processingModelLabel}...`);
   renderFiles();
   renderResults();
 
