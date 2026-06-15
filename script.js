@@ -434,6 +434,7 @@ function renderFiles() {
 
   elements.fileList.append(fragment);
   updatePayloadMeter();
+  scrollActiveCarouselItemIntoView();
 }
 
 function removeFile(id) {
@@ -828,6 +829,59 @@ function renderChromeTabs() {
   });
 
   elements.resultsTabs.append(fragment);
+  scrollActiveResultTabIntoView();
+}
+
+function scrollActiveCarouselItemIntoView() {
+  scrollChildIntoHorizontalView(elements.fileList, elements.fileList.querySelector(".image-slide.is-active"));
+}
+
+function scrollActiveResultTabIntoView() {
+  scrollChildIntoHorizontalView(elements.resultsTabs, elements.resultsTabs.querySelector(".chrome-tab.is-active"));
+}
+
+function scrollChildIntoHorizontalView(container, child) {
+  if (!container || !child || container.hidden) {
+    return;
+  }
+
+  window.requestAnimationFrame(() => {
+    if (!child.isConnected || !container.isConnected) {
+      return;
+    }
+
+    const scrollPadding = 12;
+    const currentLeft = container.scrollLeft;
+    const maxLeft = Math.max(0, container.scrollWidth - container.clientWidth);
+    const visibleStart = currentLeft + scrollPadding;
+    const visibleEnd = currentLeft + container.clientWidth - scrollPadding;
+    const childStart = child.offsetLeft;
+    const childEnd = childStart + child.offsetWidth;
+    let nextLeft = currentLeft;
+
+    if (childStart < visibleStart) {
+      nextLeft = childStart - scrollPadding;
+    } else if (childEnd > visibleEnd) {
+      nextLeft = childEnd - container.clientWidth + scrollPadding;
+    } else {
+      return;
+    }
+
+    nextLeft = Math.round(Math.max(0, Math.min(maxLeft, nextLeft)));
+
+    if (Math.abs(nextLeft - currentLeft) <= 1) {
+      return;
+    }
+
+    container.scrollTo({
+      left: nextLeft,
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
+    });
+  });
+}
+
+function prefersReducedMotion() {
+  return typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
 
 function renderResultMessage(message) {
