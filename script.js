@@ -236,11 +236,14 @@ function attachEvents() {
       return;
     }
 
-    if (!(await confirmReanalyzeAll())) {
+    const entriesToTranslate = getMainTranslateEntries(state.files);
+
+    if (entriesToTranslate.length === 0) {
+      await showNothingToTranslateAlert();
       return;
     }
 
-    analyzeImages({ entries: state.files, forceCompress: false });
+    analyzeImages({ entries: entriesToTranslate, forceCompress: false });
   });
 
   elements.clearButton.addEventListener("click", () => {
@@ -254,12 +257,20 @@ function attachEvents() {
     updateOversizePanel();
   });
 
-  elements.batchButton.addEventListener("click", () => {
-    const safeEntries = state.files.filter((entry) => !isEntryOversized(entry));
+  elements.batchButton.addEventListener("click", async () => {
+    const entriesToTranslate = getMainTranslateEntries(state.files);
+    const safeEntries = entriesToTranslate.filter((entry) => !isEntryOversized(entry));
+
     if (safeEntries.length === 0) {
-      setStatus("No safe images are available. Compress or remove oversized images first.", "error");
+      const message =
+        entriesToTranslate.length === 0
+          ? getNothingToTranslateMessage()
+          : "No safe images are available. Compress or remove oversized images first.";
+      setStatus(message, "error");
+      await showAppAlert(entriesToTranslate.length === 0 ? "Nothing to translate" : "No safe images", message);
       return;
     }
+
     analyzeImages({ entries: safeEntries, forceCompress: false });
   });
 
@@ -446,7 +457,7 @@ function createImageActions(entry) {
   const actions = document.createElement("div");
   actions.className = "image-slide-actions";
 
-  const wasSubmitted = entry.status === "done" || entry.status === "error";
+  const wasSubmitted = isRetryEntry(entry);
   const actionLabel = wasSubmitted ? "Retry" : "Analyze";
   const actionIcon = wasSubmitted ? "fa-rotate-right" : "fa-magnifying-glass";
   const analyzeButton = createImageActionButton(actionLabel, actionIcon, () => analyzeImage(entry.id));
@@ -564,6 +575,14 @@ function getActiveEntry() {
 
 function hasAnyResults() {
   return state.files.some((entry) => entry.results.length > 0);
+}
+
+function isRetryEntry(entry) {
+  return entry.status === "done" || entry.status === "error";
+}
+
+function getMainTranslateEntries(entries) {
+  return entries.filter((entry) => !isRetryEntry(entry));
 }
 
 function updateFlatResults() {
@@ -945,22 +964,6 @@ function openResultDetail(item) {
   });
 }
 
-function confirmReanalyzeAll() {
-  if (!hasAnyResults()) {
-    return Promise.resolve(true);
-  }
-
-  const message = document.createElement("p");
-  message.textContent = "This will clear current results and analyze all images again.";
-
-  return showAppModal({
-    body: message,
-    confirmText: "Analyze",
-    cancelText: "Cancel",
-    showCancel: true,
-  });
-}
-
 function hasApiKey() {
   return Boolean(elements.apiKey.value.trim());
 }
@@ -1020,6 +1023,14 @@ function showAppAlert(_title, messageText) {
     confirmText: "OK",
     showCancel: false,
   });
+}
+
+function getNothingToTranslateMessage() {
+  return "All uploaded images have already been analyzed. Use Retry on an image to translate it again.";
+}
+
+function showNothingToTranslateAlert() {
+  return showAppAlert("Nothing to translate", getNothingToTranslateMessage());
 }
 
 function showAppModal({ body, confirmText = "OK", cancelText = "Cancel", showCancel = true, hideActions = false }) {
@@ -1528,7 +1539,7 @@ function updateOversizePanel() {
     return;
   }
 
-  const safeCount = state.files.length - oversizedEntries.length;
+  const safeCount = getMainTranslateEntries(state.files).filter((entry) => !isEntryOversized(entry)).length;
 
   elements.oversizePanel.hidden = false;
   elements.oversizeMessage.textContent = `${oversizedEntries.length} image${oversizedEntries.length === 1 ? "" : "s"} exceed the ${formatBytes(PAYLOAD_SAFETY_LIMIT_BYTES)} safe per-image request limit. Compress them, analyze only the safe images, or remove images.`;
