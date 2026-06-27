@@ -9,6 +9,10 @@ const MODEL_STORAGE_KEY = "menuTranslator.geminiModel";
 const LARGE_IMAGE_WARNING_BYTES = 2 * 1024 * 1024;
 const INLINE_PAYLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
 const PAYLOAD_SAFETY_LIMIT_BYTES = 19 * 1024 * 1024;
+const RESULT_SWIPE_THRESHOLD_PX = 78;
+const RESULT_SWIPE_MAX_PX = 118;
+const RESULT_SWIPE_INTENT_PX = 10;
+const RESULT_SWIPE_AXIS_LOCK_RATIO = 0.75;
 const SUPPORTED_TYPES = new Set([
   "image/png",
   "image/jpeg",
@@ -74,10 +78,12 @@ const MENU_SCHEMA = {
 const state = {
   files: [],
   results: [],
+  cart: [],
   activeImageId: "",
   modalResolver: null,
   replaceTargetImageId: "",
   copyResetTimer: 0,
+  activeSwipe: null,
   lastPayloadEstimate: 0,
   isBusy: false,
 };
@@ -113,6 +119,19 @@ const elements = {
   noteCloseButton: document.querySelector("#note-close-button"),
   noteTitle: document.querySelector("#note-title"),
   noteText: document.querySelector("#note-text"),
+  orderBar: document.querySelector("#order-bar"),
+  orderBarButton: document.querySelector("#order-bar-button"),
+  orderBarIcon: document.querySelector("#order-bar-icon"),
+  orderBarCount: document.querySelector("#order-bar-count"),
+  orderBarSwipeIcon: document.querySelector("#order-bar-swipe-icon"),
+  orderBarHintSuffix: document.querySelector("#order-bar-hint-suffix"),
+  orderBarHintCartIcon: document.querySelector("#order-bar-hint-cart-icon"),
+  orderModal: document.querySelector("#order-modal"),
+  orderModalClose: document.querySelector("#order-modal-close"),
+  orderModalCount: document.querySelector("#order-modal-count"),
+  orderList: document.querySelector("#order-list"),
+  orderTotalRow: document.querySelector("#order-total-row"),
+  orderTotalAmount: document.querySelector("#order-total-amount"),
   appModal: document.querySelector("#app-modal"),
   appModalClose: document.querySelector("#app-modal-close"),
   appModalBody: document.querySelector("#app-modal-body"),
@@ -137,6 +156,7 @@ function init() {
   attachEvents();
   renderFiles();
   renderResults();
+  renderCart();
   updateOversizePanel();
 }
 
@@ -250,10 +270,12 @@ function attachEvents() {
     revokePreviewUrls(state.files);
     state.files = [];
     state.results = [];
+    state.cart = [];
     state.activeImageId = "";
     setStatus("Images cleared.");
     renderFiles();
     renderResults();
+    renderCart();
     updateOversizePanel();
   });
 
@@ -288,6 +310,13 @@ function attachEvents() {
   });
 
   elements.copyButton.addEventListener("click", copyResultsJson);
+  elements.orderBarButton.addEventListener("click", openOrderModal);
+  elements.orderModalClose.addEventListener("click", closeOrderModal);
+  elements.orderModal.addEventListener("click", (event) => {
+    if (event.target === elements.orderModal) {
+      closeOrderModal();
+    }
+  });
   elements.noteCloseButton.addEventListener("click", closeNote);
   elements.noteOverlay.addEventListener("click", (event) => {
     if (event.target === elements.noteOverlay) {
@@ -311,6 +340,10 @@ function attachEvents() {
 
     if (event.key === "Escape" && !elements.appModal.hidden) {
       closeAppModal(false);
+    }
+
+    if (event.key === "Escape" && !elements.orderModal.hidden) {
+      closeOrderModal();
     }
 
     if (event.key === "Escape" && !elements.keyModal.hidden) {
@@ -362,6 +395,7 @@ function addFiles(files) {
 
   renderFiles();
   renderResults();
+  renderCart();
   updateOversizePanel();
   maybeSuggestCompression(accepted);
 }
@@ -444,6 +478,7 @@ function removeFile(id) {
   }
 
   state.files = state.files.filter((entry) => entry.id !== id);
+  removeCartEntriesForImages([id]);
   if (state.activeImageId === id) {
     state.activeImageId = state.files[0]?.id || "";
   }
@@ -451,6 +486,7 @@ function removeFile(id) {
   setStatus("Image removed.");
   renderFiles();
   renderResults();
+  renderCart();
   updateOversizePanel();
 }
 
@@ -510,6 +546,7 @@ function selectImage(id) {
   state.activeImageId = id;
   renderFiles();
   renderResults();
+  renderCart();
 }
 
 function analyzeImage(id) {
@@ -562,10 +599,12 @@ function replaceImage(id, file) {
   };
 
   state.activeImageId = id;
+  removeCartEntriesForImages([id]);
   updateFlatResults();
   setStatus("Image replaced. Run Analyze to process it.");
   renderFiles();
   renderResults();
+  renderCart();
   updateOversizePanel();
   maybeSuggestCompression([state.files[index]]);
 }
@@ -621,9 +660,15 @@ async function compressUploadedImages(entries) {
     const compressedEntries = await compressEntries(compressibleEntries);
     const afterSize = compressedEntries.reduce((total, entry) => total + entry.workingFile.size, 0);
     replaceEntries(compressedEntries);
+    removeCartEntriesForImages(
+      compressedEntries
+        .filter((entry) => entry.wasCompressed && entry.results.length === 0)
+        .map((entry) => entry.id),
+    );
     updateFlatResults();
     renderFiles();
     renderResults();
+    renderCart();
     updateOversizePanel();
 
     if (afterSize < beforeSize) {
@@ -726,18 +771,33 @@ function renderResults() {
   const fragment = document.createDocumentFragment();
 
   activeEntry.results.forEach((item) => {
+    const imageId = activeEntry.id;
+    const cartItem = getCartItem(item, imageId);
     const card = document.createElement("article");
-    card.className = "menu-result-card";
+    card.className = `menu-result-card${cartItem ? " is-in-order" : ""}`;
     card.tabIndex = 0;
     card.setAttribute("role", "button");
     card.setAttribute("aria-label", `Open original text for ${item.originalText || item.translatedText || "this menu item"}`);
-    card.addEventListener("click", () => openResultDetail(item));
+    card.addEventListener("click", () => {
+      if (card.dataset.suppressClick === "true") {
+        card.dataset.suppressClick = "false";
+        return;
+      }
+
+      openResultDetail(item);
+    });
     card.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
         openResultDetail(item);
       }
     });
+    attachResultSwipe(card, item, imageId);
+
+    const removeIndicator = createSwipeIndicator("remove_shopping_cart", "result-swipe-indicator is-remove");
+    const addIndicator = createSwipeIndicator("add_shopping_cart", "result-swipe-indicator is-add");
+    const content = document.createElement("div");
+    content.className = "menu-result-content";
 
     const textStack = document.createElement("div");
     textStack.className = "result-text-stack";
@@ -755,15 +815,22 @@ function renderResults() {
     price.setAttribute("aria-label", item.price ? `Price: ${item.price}` : "No price");
     side.append(price);
 
+    const iconRow = document.createElement("div");
+    iconRow.className = `result-icon-row${item.note ? " has-note" : ""}`;
+
+    if (cartItem) {
+      const count = document.createElement("div");
+      count.className = "result-cart-count";
+      count.textContent = `×${cartItem.quantity}`;
+      iconRow.append(count);
+    }
+
+    const imageSearchButton = createImageSearchButton(item);
+    if (imageSearchButton) {
+      iconRow.append(imageSearchButton);
+    }
+
     if (item.note) {
-      const iconRow = document.createElement("div");
-      iconRow.className = "result-icon-row";
-
-      const imageSearchButton = createImageSearchButton(item);
-      if (imageSearchButton) {
-        iconRow.append(imageSearchButton);
-      }
-
       const noteButton = document.createElement("button");
       noteButton.type = "button";
       noteButton.className = "note-info-button";
@@ -774,16 +841,17 @@ function renderResults() {
         event.stopPropagation();
         openNote(item);
       });
+      noteButton.addEventListener("keydown", (event) => {
+        event.stopPropagation();
+      });
       iconRow.append(noteButton);
+    }
+    if (iconRow.children.length > 0) {
       side.append(iconRow);
-    } else {
-      const imageSearchButton = createImageSearchButton(item);
-      if (imageSearchButton) {
-        side.append(imageSearchButton);
-      }
     }
 
-    card.append(textStack, side);
+    content.append(textStack, side);
+    card.append(removeIndicator, addIndicator, content);
     fragment.append(card);
   });
 
@@ -898,6 +966,182 @@ function createResultText(value, valueClassName) {
   return valueElement;
 }
 
+function createSwipeIndicator(iconName, className) {
+  const indicator = document.createElement("div");
+  indicator.className = className;
+
+  const icon = document.createElement("span");
+  icon.className = "material-symbols-outlined";
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = iconName;
+
+  indicator.append(icon);
+  return indicator;
+}
+
+function attachResultSwipe(card, item, imageId) {
+  card.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.target.closest("button")) {
+      return;
+    }
+
+    state.activeSwipe = {
+      card,
+      item,
+      imageId,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      deltaX: 0,
+      isHorizontal: false,
+    };
+
+    if (typeof card.setPointerCapture === "function") {
+      card.setPointerCapture(event.pointerId);
+    }
+  });
+
+  card.addEventListener("pointermove", (event) => {
+    const swipe = state.activeSwipe;
+
+    if (!swipe || swipe.card !== card || swipe.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const deltaX = event.clientX - swipe.startX;
+    const deltaY = event.clientY - swipe.startY;
+    const absoluteX = Math.abs(deltaX);
+    const absoluteY = Math.abs(deltaY);
+
+    if (!swipe.isHorizontal && !hasHorizontalSwipeIntent(absoluteX, absoluteY)) {
+      return;
+    }
+
+    if (event.cancelable) {
+      event.preventDefault();
+    }
+
+    swipe.isHorizontal = true;
+    swipe.deltaX = Math.max(-RESULT_SWIPE_MAX_PX, Math.min(RESULT_SWIPE_MAX_PX, deltaX));
+    card.dataset.suppressClick = "true";
+    card.classList.add("is-swiping");
+    card.classList.toggle("is-swipe-add", swipe.deltaX > 0);
+    card.classList.toggle("is-swipe-remove", swipe.deltaX < 0);
+    card.style.setProperty("--swipe-x", `${swipe.deltaX}px`);
+    setResultSwipeProgress(card, swipe.deltaX);
+  });
+
+  card.addEventListener("pointerup", finishResultSwipe);
+  card.addEventListener("pointercancel", cancelResultSwipe);
+  card.addEventListener("touchmove", preventResultSwipeScroll, { passive: false });
+}
+
+function hasHorizontalSwipeIntent(absoluteX, absoluteY) {
+  return absoluteX >= RESULT_SWIPE_INTENT_PX && absoluteX > absoluteY * RESULT_SWIPE_AXIS_LOCK_RATIO;
+}
+
+function preventResultSwipeScroll(event) {
+  const swipe = state.activeSwipe;
+  const [touch] = Array.from(event.touches || []);
+
+  if (!swipe || swipe.card !== event.currentTarget || !touch) {
+    return;
+  }
+
+  const absoluteX = Math.abs(touch.clientX - swipe.startX);
+  const absoluteY = Math.abs(touch.clientY - swipe.startY);
+
+  if (!swipe.isHorizontal && !hasHorizontalSwipeIntent(absoluteX, absoluteY)) {
+    return;
+  }
+
+  if (event.cancelable) {
+    event.preventDefault();
+  }
+}
+
+function finishResultSwipe(event) {
+  const swipe = state.activeSwipe;
+
+  if (!swipe || swipe.pointerId !== event.pointerId) {
+    return;
+  }
+
+  let swipeAction = null;
+
+  if (Math.abs(swipe.deltaX) >= RESULT_SWIPE_THRESHOLD_PX) {
+    if (swipe.deltaX > 0) {
+      swipeAction = () => addCartItem(swipe.item, swipe.imageId);
+    } else {
+      swipeAction = () => removeOneCartItem(swipe.item, swipe.imageId);
+    }
+  }
+
+  resetResultSwipe(swipe.card, swipeAction);
+  state.activeSwipe = null;
+}
+
+function cancelResultSwipe(event) {
+  const swipe = state.activeSwipe;
+
+  if (!swipe || swipe.pointerId !== event.pointerId) {
+    return;
+  }
+
+  resetResultSwipe(swipe.card);
+  state.activeSwipe = null;
+}
+
+function resetResultSwipe(card, onComplete) {
+  const content = card.querySelector(".menu-result-content");
+  let didComplete = false;
+
+  const complete = () => {
+    if (didComplete) {
+      return;
+    }
+
+    didComplete = true;
+    content?.removeEventListener("transitionend", handleTransitionEnd);
+    card.classList.remove("is-swipe-add", "is-swipe-remove");
+    card.style.removeProperty("--swipe-x");
+    card.style.removeProperty("--swipe-indicator-opacity");
+    card.style.removeProperty("--swipe-icon-scale");
+    onComplete?.();
+  };
+
+  const handleTransitionEnd = (event) => {
+    if (event.target === content && event.propertyName === "transform") {
+      complete();
+    }
+  };
+
+  card.classList.remove("is-swiping");
+  card.style.setProperty("--swipe-indicator-opacity", "0");
+  card.style.setProperty("--swipe-icon-scale", "0.92");
+
+  content?.addEventListener("transitionend", handleTransitionEnd);
+
+  window.requestAnimationFrame(() => {
+    card.style.setProperty("--swipe-x", "0px");
+  });
+
+  window.setTimeout(complete, 260);
+
+  window.setTimeout(() => {
+    card.dataset.suppressClick = "false";
+  }, 0);
+}
+
+function setResultSwipeProgress(card, deltaX) {
+  const progress = Math.min(1, Math.abs(deltaX) / RESULT_SWIPE_THRESHOLD_PX);
+  const opacity = 0.24 + progress * 0.76;
+  const iconScale = 0.92 + progress * 0.12;
+
+  card.style.setProperty("--swipe-indicator-opacity", opacity.toFixed(3));
+  card.style.setProperty("--swipe-icon-scale", iconScale.toFixed(3));
+}
+
 function createImageSearchButton(item) {
   const query = (item.originalText || item.translatedText || "").trim();
 
@@ -913,6 +1157,9 @@ function createImageSearchButton(item) {
   searchButton.addEventListener("click", (event) => {
     event.stopPropagation();
     openImageSearch(query);
+  });
+  searchButton.addEventListener("keydown", (event) => {
+    event.stopPropagation();
   });
 
   const icon = document.createElement("span");
@@ -942,6 +1189,463 @@ function openNote(item) {
 
 function closeNote() {
   elements.noteOverlay.hidden = true;
+}
+
+function getCartItem(item, imageId) {
+  const itemKey = createCartItemKey(item, imageId);
+  return state.cart.find((cartItem) => cartItem.itemKey === itemKey) || null;
+}
+
+function addCartItem(item, imageId) {
+  const itemKey = createCartItemKey(item, imageId);
+  const existingItem = state.cart.find((cartItem) => cartItem.itemKey === itemKey);
+
+  if (existingItem) {
+    existingItem.quantity += 1;
+  } else {
+    state.cart.push(createCartItem(item, imageId, itemKey));
+  }
+
+  setStatus("Added to order.", "success");
+  renderResults();
+  renderCart();
+}
+
+function removeOneCartItem(item, imageId) {
+  const cartItem = getCartItem(item, imageId);
+
+  if (!cartItem) {
+    setStatus("Item is not in order.");
+    return;
+  }
+
+  cartItem.quantity -= 1;
+
+  if (cartItem.quantity <= 0) {
+    state.cart = state.cart.filter((itemInCart) => itemInCart.id !== cartItem.id);
+  }
+
+  setStatus("Removed from order.");
+  renderResults();
+  renderCart();
+}
+
+function createCartItem(item, imageId, itemKey = createCartItemKey(item, imageId)) {
+  return {
+    id: createId(),
+    imageId,
+    itemKey,
+    originalText: item.originalText || "",
+    translatedText: item.translatedText || "",
+    price: item.price || "",
+    quantity: 1,
+  };
+}
+
+function createCartItemKey(item, imageId) {
+  return [
+    imageId,
+    normalizeCartKeyPart(item.originalText),
+    normalizeCartKeyPart(item.translatedText),
+    normalizeCartKeyPart(item.price),
+  ].join("\u001f");
+}
+
+function normalizeCartKeyPart(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function removeCartEntriesForImages(imageIds) {
+  const ids = new Set(imageIds);
+  const nextCart = state.cart.filter((item) => !ids.has(item.imageId));
+
+  if (nextCart.length === state.cart.length) {
+    return;
+  }
+
+  state.cart = nextCart;
+  renderCart();
+}
+
+function updateCartQuantity(cartItemId, delta) {
+  const item = state.cart.find((cartItem) => cartItem.id === cartItemId);
+
+  if (!item) {
+    return;
+  }
+
+  item.quantity += delta;
+
+  if (item.quantity <= 0) {
+    state.cart = state.cart.filter((cartItem) => cartItem.id !== cartItemId);
+  }
+
+  renderResults();
+  renderCart();
+}
+
+function getCartItemCount() {
+  return state.cart.reduce((total, item) => total + item.quantity, 0);
+}
+
+function hasActiveResultItems() {
+  return (getActiveEntry()?.results.length || 0) > 0;
+}
+
+function getCartLineAmountText(item) {
+  const price = parseCartPrice(item.price);
+
+  if (!price) {
+    return item.price || "";
+  }
+
+  return formatCartAmount({
+    ...price,
+    amount: price.amount * item.quantity,
+  });
+}
+
+function calculateCartTotal() {
+  const candidates = [];
+  let isPartial = false;
+
+  for (const item of state.cart) {
+    if (!String(item.price || "").trim()) {
+      isPartial = true;
+      continue;
+    }
+
+    const price = parseCartPrice(item.price);
+
+    if (!price || !isCartTotalCandidate(price)) {
+      isPartial = true;
+      continue;
+    }
+
+    candidates.push({
+      price,
+      quantity: item.quantity,
+      signKey: getCartPriceSignKey(price),
+      styleKey: getCartPriceStyleKey(price),
+    });
+  }
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const dominantSignKey = getDominantCartKey(candidates, "signKey");
+  const dominantStyleKey = getDominantCartKey(
+    candidates.filter((candidate) => candidate.signKey === dominantSignKey),
+    "styleKey",
+  );
+  const stylePrice = candidates.find((candidate) => candidate.styleKey === dominantStyleKey)?.price || candidates[0].price;
+  const total = {
+    amount: 0,
+    prefix: stylePrice.prefix,
+    suffix: stylePrice.suffix,
+    decimals: stylePrice.decimals,
+    decimalSeparator: stylePrice.decimalSeparator,
+    thousandsSeparator: stylePrice.thousandsSeparator,
+    isPartial,
+  };
+
+  candidates.forEach((candidate) => {
+    if (candidate.signKey !== dominantSignKey) {
+      total.isPartial = true;
+      return;
+    }
+
+    total.amount += candidate.price.amount * candidate.quantity;
+    total.decimals = Math.max(total.decimals, candidate.price.decimals);
+  });
+
+  total.decimalSeparator = total.decimalSeparator || stylePrice.decimalSeparator;
+  total.thousandsSeparator = total.thousandsSeparator || stylePrice.thousandsSeparator;
+
+  return total;
+}
+
+function isCartTotalCandidate(price) {
+  const signText = `${price.prefix} ${price.suffix}`;
+  const ambiguousWords = /\b(from|starting|starts|start|add|extra|addon|add-on|supplement|upcharge|approx|about|around|market|varies)\b/i;
+
+  return !/[+]/.test(signText) && !ambiguousWords.test(signText);
+}
+
+function getCartPriceSignKey(price) {
+  return `${price.prefix}${price.suffix}`.replace(/\s+/g, "").toLowerCase();
+}
+
+function getCartPriceStyleKey(price) {
+  return [
+    price.prefix,
+    price.suffix,
+    price.decimalSeparator,
+    price.thousandsSeparator,
+  ].join("\u001f");
+}
+
+function getDominantCartKey(candidates, keyName) {
+  const counts = new Map();
+
+  candidates.forEach((candidate) => {
+    counts.set(candidate[keyName], (counts.get(candidate[keyName]) || 0) + candidate.quantity);
+  });
+
+  let dominantKey = "";
+  let dominantCount = -1;
+
+  counts.forEach((count, key) => {
+    if (count > dominantCount || (count === dominantCount && dominantKey === "" && key !== "")) {
+      dominantKey = key;
+      dominantCount = count;
+    }
+  });
+
+  return dominantKey;
+}
+
+function parseCartPrice(value) {
+  const text = String(value || "").trim();
+  const matches = Array.from(text.matchAll(/\d[\d,.]*/g));
+
+  if (matches.length !== 1) {
+    return null;
+  }
+
+  const match = matches[0];
+  const rawAmount = match[0];
+  const normalizedAmount = normalizeCartAmount(rawAmount);
+  const amount = Number(normalizedAmount.value);
+
+  if (!Number.isFinite(amount)) {
+    return null;
+  }
+
+  return {
+    amount,
+    prefix: text.slice(0, match.index).trim(),
+    suffix: text.slice(match.index + rawAmount.length).trim(),
+    decimals: normalizedAmount.decimals,
+    decimalSeparator: normalizedAmount.decimalSeparator,
+    thousandsSeparator: normalizedAmount.thousandsSeparator,
+  };
+}
+
+function normalizeCartAmount(value) {
+  const text = String(value || "");
+  const lastComma = text.lastIndexOf(",");
+  const lastDot = text.lastIndexOf(".");
+  let decimalSeparator = "";
+
+  if (lastComma >= 0 && lastDot >= 0) {
+    decimalSeparator = lastComma > lastDot ? "," : ".";
+  } else if (lastComma >= 0) {
+    decimalSeparator = inferDecimalSeparator(text, ",");
+  } else if (lastDot >= 0) {
+    decimalSeparator = inferDecimalSeparator(text, ".");
+  }
+
+  if (!decimalSeparator) {
+    return {
+      value: text.replace(/[,.]/g, ""),
+      decimals: 0,
+      decimalSeparator: "",
+      thousandsSeparator: getThousandsSeparator(text, ""),
+    };
+  }
+
+  const decimalIndex = text.lastIndexOf(decimalSeparator);
+  const integerPart = text.slice(0, decimalIndex).replace(/[,.]/g, "");
+  const decimalPart = text.slice(decimalIndex + 1).replace(/[,.]/g, "");
+
+  return {
+    value: `${integerPart || "0"}.${decimalPart}`,
+    decimals: decimalPart.length,
+    decimalSeparator,
+    thousandsSeparator: getThousandsSeparator(text, decimalSeparator),
+  };
+}
+
+function getThousandsSeparator(value, decimalSeparator) {
+  const thousandsSeparator = decimalSeparator === "," ? "." : ",";
+
+  if (value.includes(thousandsSeparator)) {
+    return thousandsSeparator;
+  }
+
+  if (!decimalSeparator && value.includes(",")) {
+    return ",";
+  }
+
+  if (!decimalSeparator && value.includes(".")) {
+    return ".";
+  }
+
+  return "";
+}
+
+function inferDecimalSeparator(value, separator) {
+  const parts = value.split(separator);
+  const lastPart = parts[parts.length - 1] || "";
+
+  if (parts.length === 2) {
+    return lastPart.length > 0 && lastPart.length <= 2 ? separator : "";
+  }
+
+  const hasThousandsGroups = parts.slice(1).every((part) => part.length === 3);
+
+  if (hasThousandsGroups) {
+    return "";
+  }
+
+  return lastPart.length > 0 && lastPart.length <= 2 ? separator : "";
+}
+
+function formatCartAmount({ amount, prefix, suffix, decimals, decimalSeparator = ".", thousandsSeparator = ",", isPartial = false }) {
+  const fixedAmount = formatCartNumber(amount, decimals, decimalSeparator, thousandsSeparator);
+  const prefixGap = prefix && /[A-Za-z]$/.test(prefix) ? " " : "";
+  const suffixGap = suffix && /^[A-Za-z]/.test(suffix) ? " " : "";
+  const partialMarker = isPartial ? "+" : "";
+
+  return `${prefix || ""}${prefixGap}${fixedAmount}${suffixGap}${suffix || ""}${partialMarker}`;
+}
+
+function formatCartNumber(amount, decimals, decimalSeparator, thousandsSeparator) {
+  const [integerPart, decimalPart] = amount.toFixed(decimals).split(".");
+  const groupedInteger = thousandsSeparator
+    ? integerPart.replace(/\B(?=(\d{3})+(?!\d))/g, thousandsSeparator)
+    : integerPart;
+
+  if (!decimalPart) {
+    return groupedInteger;
+  }
+
+  return `${groupedInteger}${decimalSeparator || "."}${decimalPart}`;
+}
+
+function renderCart() {
+  const itemCount = getCartItemCount();
+  const itemCountText = `${itemCount} item${itemCount === 1 ? "" : "s"}`;
+  const shouldShowOrderBar = hasActiveResultItems() || itemCount > 0;
+  const total = calculateCartTotal();
+  const totalText = total ? formatCartAmount(total) : "";
+  const orderBarText = itemCount > 0 && totalText ? `${itemCountText} • ${totalText}` : itemCount > 0 ? itemCountText : "Swipe";
+
+  elements.orderBar.hidden = !shouldShowOrderBar;
+  document.body.classList.toggle("has-order-bar", shouldShowOrderBar);
+  elements.orderBarButton.setAttribute("aria-label", itemCount > 0 ? `Order, ${itemCountText}` : "Swipe right to add to order");
+  elements.orderBarIcon.hidden = itemCount === 0;
+  elements.orderBarSwipeIcon.hidden = itemCount > 0;
+  elements.orderBarHintSuffix.hidden = itemCount > 0;
+  elements.orderBarHintCartIcon.hidden = itemCount > 0;
+  elements.orderBarCount.textContent = orderBarText;
+  elements.orderModalCount.textContent = itemCountText;
+  elements.orderTotalRow.hidden = !total;
+  elements.orderTotalAmount.textContent = total ? formatCartAmount(total) : "";
+  elements.orderList.classList.toggle("has-total", Boolean(total));
+
+  if (!shouldShowOrderBar && !elements.orderModal.hidden) {
+    closeOrderModal();
+  }
+
+  renderOrderList();
+}
+
+function createOrderEmptyIcon(iconName) {
+  const icon = document.createElement("span");
+  icon.className = `material-symbols-outlined order-empty-icon is-${iconName.replace(/_/g, "-")}`;
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = iconName;
+  return icon;
+}
+
+function renderOrderList() {
+  elements.orderList.innerHTML = "";
+
+  if (state.cart.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "order-empty-state";
+
+    const emptyLine = document.createElement("span");
+    emptyLine.className = "order-empty-line";
+    emptyLine.append("Pick favorites, then show this to staff", createOrderEmptyIcon("person_apron"));
+
+    empty.append(emptyLine);
+    elements.orderList.append(empty);
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+
+  state.cart.forEach((item) => {
+    const row = document.createElement("article");
+    row.className = "order-item";
+
+    const textStack = document.createElement("div");
+    textStack.className = "order-item-text";
+
+    const original = document.createElement("p");
+    original.className = "order-item-original";
+    original.textContent = item.originalText || item.translatedText || "Menu item";
+
+    const translation = document.createElement("p");
+    translation.className = "order-item-translation";
+    translation.textContent = item.translatedText || item.originalText || "";
+
+    textStack.append(original, translation);
+
+    const quantity = document.createElement("div");
+    quantity.className = "order-item-quantity";
+    quantity.textContent = `×${item.quantity}`;
+
+    const side = document.createElement("div");
+    side.className = "order-item-side";
+
+    const price = document.createElement("div");
+    price.className = "order-item-price";
+    price.textContent = getCartLineAmountText(item);
+
+    const controls = document.createElement("div");
+    controls.className = "order-quantity-controls";
+    controls.append(
+      createQuantityButton("remove", `Remove one ${item.translatedText || item.originalText || "item"}`, () => updateCartQuantity(item.id, -1)),
+      createQuantityButton("add", `Add one ${item.translatedText || item.originalText || "item"}`, () => updateCartQuantity(item.id, 1)),
+    );
+
+    side.append(price, controls);
+    row.append(textStack, quantity, side);
+    fragment.append(row);
+  });
+
+  elements.orderList.append(fragment);
+}
+
+function createQuantityButton(iconName, label, onClick) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "order-quantity-button";
+  button.setAttribute("aria-label", label);
+  button.addEventListener("click", onClick);
+
+  const icon = document.createElement("span");
+  icon.className = "material-symbols-outlined";
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = iconName;
+
+  button.append(icon);
+  return button;
+}
+
+function openOrderModal() {
+  renderCart();
+  elements.orderModal.hidden = false;
+  elements.orderModalClose.focus();
+}
+
+function closeOrderModal() {
+  elements.orderModal.hidden = true;
 }
 
 async function maybeSuggestCompression(entries) {
@@ -1279,8 +1983,10 @@ async function analyzeImages({ entries, forceCompress }) {
       entry.status = "idle";
       entry.processingModelLabel = "";
     });
+    removeCartEntriesForImages(entriesToSend.map((entry) => entry.id));
     updateFlatResults();
     renderResults();
+    renderCart();
     elements.oversizePanel.hidden = true;
 
     let successCount = 0;
@@ -1297,6 +2003,7 @@ async function analyzeImages({ entries, forceCompress }) {
       entry.processingModelLabel = modelLabel;
       renderFiles();
       renderResults();
+      renderCart();
 
       const label = totalImages === 1 ? `Analyzing ${entry.name} with ${modelLabel}...` : `Analyzing image ${index + 1} of ${totalImages} with ${modelLabel}...`;
       setStatus(label);
@@ -1313,6 +2020,7 @@ async function analyzeImages({ entries, forceCompress }) {
         updateFlatResults();
         renderFiles();
         renderResults();
+        renderCart();
 
         const fallbackResult = await applyLiteForRun(entry, error);
 
@@ -1330,6 +2038,7 @@ async function analyzeImages({ entries, forceCompress }) {
       updateFlatResults();
       renderFiles();
       renderResults();
+      renderCart();
       updateProgress((index + 1) / totalImages);
     }
 
@@ -1386,6 +2095,7 @@ async function applyLiteForRun(entry, error) {
   setStatus(`Retrying ${entry.name} with ${entry.processingModelLabel}...`);
   renderFiles();
   renderResults();
+  renderCart();
 
   try {
     entry.results = await callGemini([entry], FALLBACK_MODEL);
@@ -1768,6 +2478,7 @@ function setBusy(isBusy) {
 
   renderFiles();
   renderResults();
+  renderCart();
   updateCompressionControls();
   updateOversizePanel();
 }

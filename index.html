@@ -14,7 +14,7 @@
     />
     <link
       rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=add_a_photo,compress,menu_book_2,photo_library,scan"
+      href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=add,add_a_photo,add_shopping_cart,compress,menu_book_2,person_apron,photo_library,remove,remove_shopping_cart,scan,shopping_cart,swipe_right,takeout_dining_2"
     />
     <link rel="stylesheet" href="style.css" />
   </head>
@@ -148,6 +148,20 @@
       </section>
     </div>
 
+    <div id="order-bar" class="order-bar" hidden>
+      <button id="order-bar-button" class="order-bar-button" type="button" aria-label="Order">
+        <span id="order-bar-icon" class="material-symbols-outlined" aria-hidden="true">shopping_cart</span>
+        <span id="order-bar-count">0 items</span>
+        <span id="order-bar-swipe-icon" class="material-symbols-outlined order-bar-hint-icon" aria-hidden="true" hidden>
+          swipe_right
+        </span>
+        <span id="order-bar-hint-suffix" class="order-bar-hint-suffix" hidden>to add</span>
+        <span id="order-bar-hint-cart-icon" class="material-symbols-outlined order-bar-hint-icon" aria-hidden="true" hidden>
+          shopping_cart
+        </span>
+      </button>
+    </div>
+
     <div id="note-overlay" class="note-overlay" role="dialog" aria-modal="true" aria-labelledby="note-title" hidden>
       <div class="note-sheet">
         <button id="note-close-button" class="note-close-button" type="button" aria-label="Close note">x</button>
@@ -164,6 +178,22 @@
         <div id="app-modal-actions" class="app-modal-actions">
           <button id="app-modal-cancel" class="modal-secondary-button" type="button">Cancel</button>
           <button id="app-modal-confirm" class="modal-primary-button" type="button">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="order-modal" class="app-modal order-modal" role="dialog" aria-modal="true" aria-labelledby="order-title" hidden>
+      <div class="app-modal-panel order-modal-panel">
+        <button id="order-modal-close" class="modal-close-button" type="button" aria-label="Close order">x</button>
+        <div class="order-modal-header">
+          <span class="material-symbols-outlined" aria-hidden="true">takeout_dining_2</span>
+          <h2 id="order-title">Order</h2>
+          <span id="order-modal-count" class="order-modal-count">0 items</span>
+        </div>
+        <div id="order-list" class="order-list"></div>
+        <div id="order-total-row" class="order-total-row" hidden>
+          <span>Amount</span>
+          <span id="order-total-amount"></span>
         </div>
       </div>
     </div>
