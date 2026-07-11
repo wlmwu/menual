@@ -657,7 +657,7 @@ function isRetryEntry(entry) {
 }
 
 function getMainTranslateEntries(entries) {
-  return entries.filter((entry) => !isRetryEntry(entry));
+  return entries.filter((entry) => entry.status !== "done");
 }
 
 function updateFlatResults() {
