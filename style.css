@@ -851,6 +851,30 @@ select:focus {
   background: rgba(255, 255, 255, 0.24);
 }
 
+.header-action-button.is-icon-only {
+  width: 32px;
+  min-width: 32px;
+  border-color: transparent;
+  appearance: none;
+  background: transparent;
+  -webkit-tap-highlight-color: transparent;
+  padding: 0;
+}
+
+.header-action-button.is-icon-only:hover:not(:disabled),
+.header-action-button.is-icon-only:focus-visible,
+.header-action-button.is-icon-only:active {
+  background: transparent;
+}
+
+.header-action-button.is-icon-only.is-success {
+  background: transparent;
+}
+
+.header-action-button.is-icon-only i {
+  font-size: 15px;
+}
+
 .header-action-button .material-symbols-outlined,
 .compress-chip .material-symbols-outlined,
 .btn-primary .material-symbols-outlined {
@@ -1382,7 +1406,7 @@ select:focus {
 
 .order-modal-header {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   gap: 10px;
   align-items: center;
   border-radius: var(--radius-lg) var(--radius-lg) 0 0;
@@ -1413,6 +1437,43 @@ select:focus {
   font-family: var(--font-head);
   font-size: 13px;
   font-weight: 900;
+  white-space: nowrap;
+}
+
+.order-copy-button {
+  display: inline-flex;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 50%;
+  appearance: none;
+  background: transparent;
+  -webkit-tap-highlight-color: transparent;
+  color: var(--primary-color);
+  padding: 0;
+}
+
+.order-copy-button[hidden] {
+  display: none;
+}
+
+.order-copy-button i {
+  font-size: 15px;
+}
+
+.order-copy-button:hover,
+.order-copy-button:focus-visible,
+.order-copy-button:active {
+  background: transparent;
+}
+
+.order-copy-button.is-success {
+  outline: none;
+  background: transparent;
 }
 
 .order-list {

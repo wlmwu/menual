@@ -136,9 +136,8 @@
       <section class="app-card results-card" aria-labelledby="results-title">
         <div class="card-header-bar">
           <span id="results-title">Results</span>
-          <button id="copy-button" class="header-action-button" type="button" disabled aria-label="Copy JSON">
+          <button id="copy-button" class="header-action-button is-icon-only" type="button" disabled aria-label="Copy results">
             <i class="fa-regular fa-copy" aria-hidden="true"></i>
-            <span>JSON</span>
           </button>
         </div>
         <div class="card-body">
@@ -188,6 +187,9 @@
         <div class="order-modal-header">
           <span class="material-symbols-outlined" aria-hidden="true">takeout_dining_2</span>
           <h2 id="order-title">Order</h2>
+          <button id="order-copy-button" class="order-copy-button" type="button" disabled hidden aria-label="Copy order">
+            <i class="fa-regular fa-copy" aria-hidden="true"></i>
+          </button>
           <span id="order-modal-count" class="order-modal-count">0 items</span>
         </div>
         <div id="order-list" class="order-list"></div>

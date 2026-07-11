@@ -96,6 +96,7 @@ const state = {
   modalResolver: null,
   replaceTargetImageId: "",
   copyResetTimer: 0,
+  orderCopyResetTimer: 0,
   photoSaveTimer: 0,
   photoSavePromise: Promise.resolve(),
   activeSwipe: null,
@@ -150,6 +151,7 @@ const elements = {
   orderModal: document.querySelector("#order-modal"),
   orderModalClose: document.querySelector("#order-modal-close"),
   orderModalCount: document.querySelector("#order-modal-count"),
+  orderCopyButton: document.querySelector("#order-copy-button"),
   orderList: document.querySelector("#order-list"),
   orderTotalRow: document.querySelector("#order-total-row"),
   orderTotalAmount: document.querySelector("#order-total-amount"),
@@ -332,7 +334,7 @@ function attachEvents() {
     elements.fileList.focus();
   });
 
-  elements.copyButton.addEventListener("click", copyResultsJson);
+  elements.copyButton.addEventListener("click", copyResultsText);
   window.addEventListener("pagehide", flushUploadedPhotosBeforeUnload);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
@@ -341,6 +343,7 @@ function attachEvents() {
   });
   elements.orderBarButton.addEventListener("click", openOrderModal);
   elements.orderModalClose.addEventListener("click", closeOrderModal);
+  elements.orderCopyButton.addEventListener("click", copyOrderText);
   elements.orderModal.addEventListener("click", (event) => {
     if (event.target === elements.orderModal) {
       closeOrderModal();
@@ -2269,6 +2272,8 @@ function renderCart() {
   elements.orderBarHintCartIcon.hidden = itemCount > 0;
   elements.orderBarCount.textContent = orderBarText;
   elements.orderModalCount.textContent = itemCountText;
+  elements.orderCopyButton.hidden = itemCount === 0;
+  elements.orderCopyButton.disabled = itemCount === 0;
   elements.orderTotalRow.hidden = !total;
   elements.orderTotalAmount.textContent = total ? formatCartAmount(total) : "";
   elements.orderList.classList.toggle("has-total", Boolean(total));
@@ -3278,42 +3283,166 @@ function updateProgress(value) {
   elements.progressFill.style.width = `${percent}%`;
 }
 
-function setCopyButtonSuccess() {
-  const icon = elements.copyButton.querySelector("i");
+function setCopyButtonSuccess(button, timerKey, resetIconClass = "fa-regular fa-copy") {
+  const icon = button.querySelector("i");
 
   if (!icon) {
     return;
   }
 
-  window.clearTimeout(state.copyResetTimer);
+  window.clearTimeout(state[timerKey]);
   icon.className = "fa-solid fa-check";
-  elements.copyButton.classList.add("is-success");
+  button.classList.add("is-success");
 
-  state.copyResetTimer = window.setTimeout(() => {
-    icon.className = "fa-regular fa-copy";
-    elements.copyButton.classList.remove("is-success");
+  state[timerKey] = window.setTimeout(() => {
+    icon.className = resetIconClass;
+    button.classList.remove("is-success");
   }, 1100);
 }
 
-async function copyResultsJson() {
+async function copyResultsText() {
   if (!hasAnyResults()) {
     return;
   }
 
-  const imageGroups = state.files
-    .filter((entry) => entry.results.length > 0)
-    .map((entry) => ({
-      image: entry.name,
-      items: entry.results,
-    }));
+  const text = formatResultsCopyText();
+
+  if (!text) {
+    return;
+  }
 
   try {
-    await navigator.clipboard.writeText(JSON.stringify({ images: imageGroups }, null, 2));
-    setCopyButtonSuccess();
-    setStatus("Result JSON copied.", "success");
+    await navigator.clipboard.writeText(text);
+    setCopyButtonSuccess(elements.copyButton, "copyResetTimer");
+    setStatus("Results copied.", "success");
   } catch {
-    setStatus("Could not copy JSON to the clipboard.", "error");
+    setStatus("Could not copy results to the clipboard.", "error");
   }
+}
+
+async function copyOrderText() {
+  if (state.cart.length === 0) {
+    return;
+  }
+
+  const text = formatOrderCopyText();
+
+  if (!text) {
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(text);
+    setCopyButtonSuccess(elements.orderCopyButton, "orderCopyResetTimer");
+    setStatus("Order copied.", "success");
+  } catch {
+    setStatus("Could not copy order to the clipboard.", "error");
+  }
+}
+
+function formatResultsCopyText() {
+  return state.files
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => entry.results.length > 0)
+    .map(({ entry, index }) => formatImageResultsCopyText(entry, index))
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function formatImageResultsCopyText(entry, index) {
+  const items = entry.results.map(formatResultItemCopyText).filter(Boolean);
+
+  if (items.length === 0) {
+    return "";
+  }
+
+  return [`📜 Image ${index + 1}`, items.map((item) => `👉 ${item}`).join("\n\n")].join("\n");
+}
+
+function formatResultItemCopyText(item) {
+  const translatedText = stringifyField(item.translatedText);
+  const originalText = stringifyField(item.originalText);
+  const price = stringifyField(item.price);
+  const lines = [];
+
+  if (translatedText) {
+    lines.push(translatedText);
+  }
+
+  if (originalText && normalizeCopyText(originalText) !== normalizeCopyText(translatedText)) {
+    lines.push(originalText);
+  }
+
+  if (price) {
+    lines.push(`💵 ${price}`);
+  }
+
+  return lines.join("\n");
+}
+
+function formatOrderCopyText() {
+  const items = state.cart.map(formatOrderItemCopyText).filter(Boolean);
+
+  if (items.length === 0) {
+    return "";
+  }
+
+  const itemCount = getCartItemCount();
+  const total = calculateCartTotal();
+  const itemCountText = `${itemCount} item${itemCount === 1 ? "" : "s"}`;
+  const summary = total ? `💸 Total is ${formatCartAmount(total)}\n💸 ${itemCountText}` : `💸 ${itemCountText}`;
+  const itemBlocks = items.map((item) => `👉 ${item}`);
+
+  return [summary, itemBlocks.join("\n\n")].join("\n\n");
+}
+
+function formatOrderItemCopyText(item) {
+  const originalText = stringifyField(item.originalText);
+  const translatedText = stringifyField(item.translatedText);
+  const primaryText = translatedText || originalText || "Menu item";
+  const lineAmount = formatOrderItemCopyAmount(item);
+  const lines = [primaryText];
+
+  if (originalText && normalizeCopyText(originalText) !== normalizeCopyText(primaryText)) {
+    lines.push(originalText);
+  }
+
+  lines.push(`×${item.quantity}`);
+
+  if (lineAmount) {
+    lines.push(`💵 ${lineAmount}`);
+  }
+
+  return lines.join("\n");
+}
+
+function formatOrderItemCopyAmount(item) {
+  const rawPrice = stringifyField(item.price);
+
+  if (!rawPrice) {
+    return "";
+  }
+
+  const price = parseCartPrice(rawPrice);
+
+  if (!price) {
+    return item.quantity > 1 ? `${rawPrice} x ${item.quantity}` : rawPrice;
+  }
+
+  const totalAmount = formatCartAmount({
+    ...price,
+    amount: price.amount * item.quantity,
+  });
+
+  if (item.quantity <= 1) {
+    return totalAmount;
+  }
+
+  return `${totalAmount} (${formatCartAmount(price)} x ${item.quantity})`;
+}
+
+function normalizeCopyText(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 function formatBytes(bytes) {
