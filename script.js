@@ -6,6 +6,17 @@ const FALLBACK_MODEL_LABEL = "Gemini Flash-Lite Latest";
 const API_KEY_STORAGE_KEY = "menuTranslator.geminiApiKey";
 const API_KEY_HASH_PARAM = "key";
 const MODEL_STORAGE_KEY = "menuTranslator.geminiModel";
+const PHOTO_STORAGE_DB_NAME = "menual.photos";
+const PHOTO_STORAGE_DB_VERSION = 1;
+const PHOTO_STORAGE_STORE_NAME = "snapshots";
+const PHOTO_STORAGE_RECORD_ID = "current";
+const PHOTO_SESSION_STORAGE_KEY = "menual.photoSnapshot";
+const PROCESSED_RESULTS_RECORD_ID = "processed-results";
+const PROCESSED_RESULTS_SESSION_STORAGE_KEY = "menual.processedResults";
+const CART_RECORD_ID = "cart";
+const CART_SESSION_STORAGE_KEY = "menual.cart";
+const PHOTO_STORAGE_SAVE_DELAY_MS = 100;
+const PHOTO_STORAGE_TIMEOUT_MS = 1200;
 const LARGE_IMAGE_WARNING_BYTES = 2 * 1024 * 1024;
 const INLINE_PAYLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
 const PAYLOAD_SAFETY_LIMIT_BYTES = 19 * 1024 * 1024;
@@ -42,6 +53,8 @@ const GEMINI_MODELS = {
     apiModel: FALLBACK_MODEL,
   },
 };
+
+const RESTORABLE_RESULT_STATUSES = new Set(["done", "error"]);
 
 const MENU_SCHEMA = {
   type: "object",
@@ -83,10 +96,18 @@ const state = {
   modalResolver: null,
   replaceTargetImageId: "",
   copyResetTimer: 0,
+  photoSaveTimer: 0,
+  photoSavePromise: Promise.resolve(),
   activeSwipe: null,
   lastPayloadEstimate: 0,
   isBusy: false,
+  isRestoringPhotos: false,
+  photoSaveFailed: false,
 };
+
+let photoStorageDbPromise = null;
+const photoDataUrlCache = new WeakMap();
+const photoDataUrlPromiseCache = new WeakMap();
 
 const elements = {
   form: document.querySelector("#translator-form"),
@@ -158,6 +179,7 @@ function init() {
   renderResults();
   renderCart();
   updateOversizePanel();
+  restoreUploadedPhotos();
 }
 
 function populateLanguageSelect() {
@@ -273,6 +295,7 @@ function attachEvents() {
     state.cart = [];
     state.activeImageId = "";
     setStatus("Images cleared.");
+    clearUploadedPhotoSnapshot();
     renderFiles();
     renderResults();
     renderCart();
@@ -310,6 +333,12 @@ function attachEvents() {
   });
 
   elements.copyButton.addEventListener("click", copyResultsJson);
+  window.addEventListener("pagehide", flushUploadedPhotosBeforeUnload);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      flushUploadedPhotosBeforeUnload();
+    }
+  });
   elements.orderBarButton.addEventListener("click", openOrderModal);
   elements.orderModalClose.addEventListener("click", closeOrderModal);
   elements.orderModal.addEventListener("click", (event) => {
@@ -397,6 +426,7 @@ function addFiles(files) {
   renderResults();
   renderCart();
   updateOversizePanel();
+  saveUploadedPhotos();
   maybeSuggestCompression(accepted);
 }
 
@@ -488,6 +518,8 @@ function removeFile(id) {
   renderResults();
   renderCart();
   updateOversizePanel();
+  saveUploadedPhotos();
+  saveProcessedResults();
 }
 
 function createImageActions(entry) {
@@ -547,6 +579,7 @@ function selectImage(id) {
   renderFiles();
   renderResults();
   renderCart();
+  scheduleUploadedPhotosSave();
 }
 
 function analyzeImage(id) {
@@ -606,6 +639,8 @@ function replaceImage(id, file) {
   renderResults();
   renderCart();
   updateOversizePanel();
+  saveUploadedPhotos();
+  saveProcessedResults();
   maybeSuggestCompression([state.files[index]]);
 }
 
@@ -632,6 +667,693 @@ function updateFlatResults() {
 function replaceEntries(updatedEntries) {
   const updatedById = new Map(updatedEntries.map((entry) => [entry.id, entry]));
   state.files = state.files.map((entry) => updatedById.get(entry.id) || entry);
+  scheduleUploadedPhotosSave();
+}
+
+async function restoreUploadedPhotos() {
+  state.isRestoringPhotos = true;
+
+  try {
+    const snapshots = await readUploadedPhotoSnapshots();
+    let snapshot = null;
+    let restoredFiles = [];
+
+    if (state.files.length > 0) {
+      return;
+    }
+
+    for (const candidate of snapshots) {
+      if (!candidate || !Array.isArray(candidate.files) || candidate.files.length === 0) {
+        continue;
+      }
+
+      const candidateFiles = candidate.files.map(restoreUploadedPhotoEntry).filter(Boolean);
+
+      if (candidateFiles.length > 0) {
+        snapshot = candidate;
+        restoredFiles = candidateFiles;
+        break;
+      }
+    }
+
+    if (restoredFiles.length === 0) {
+      return;
+    }
+
+    state.files = restoredFiles;
+    state.results = [];
+    state.cart = [];
+    state.activeImageId = restoredFiles.some((entry) => entry.id === snapshot.activeImageId)
+      ? snapshot.activeImageId
+      : restoredFiles[0].id;
+
+    await restoreProcessedResultsIntoFiles(restoredFiles);
+    await restoreCartIntoState(restoredFiles);
+    updateFlatResults();
+    renderFiles();
+    renderResults();
+    renderCart();
+    updateOversizePanel();
+    const restoredResultCount = state.results.length;
+    const imageText = `${restoredFiles.length} image${restoredFiles.length === 1 ? "" : "s"}`;
+    const resultText = `${restoredResultCount} item${restoredResultCount === 1 ? "" : "s"}`;
+    setStatus(restoredResultCount > 0 ? `Restored ${imageText} and ${resultText}.` : `Restored ${imageText}. Run Analyze to translate.`, "success");
+  } catch (error) {
+    console.warn("Could not restore uploaded photos.", error);
+  } finally {
+    state.isRestoringPhotos = false;
+  }
+}
+
+function restoreUploadedPhotoEntry(entry) {
+  const workingFile =
+    normalizeRestoredPhotoFile(entry?.workingFile, entry?.name, entry?.type) ||
+    dataUrlToFile(entry?.workingFileDataUrl, entry?.name, entry?.type);
+
+  if (!workingFile) {
+    return null;
+  }
+
+  const type = entry?.type || getFileType(workingFile);
+  const originalSize = Number(entry?.originalSize) || workingFile.size;
+
+  if (!SUPPORTED_TYPES.has(type)) {
+    return null;
+  }
+
+  return {
+    id: entry?.id || createId(),
+    file: workingFile,
+    name: entry?.name || workingFile.name || "menu-image",
+    type,
+    originalSize,
+    workingFile,
+    previewUrl: URL.createObjectURL(workingFile),
+    status: "idle",
+    results: [],
+    error: "",
+    shouldSuggestCompression: Boolean(entry?.shouldSuggestCompression ?? (originalSize >= LARGE_IMAGE_WARNING_BYTES)),
+    compressionSuggestionShown: Boolean(entry?.compressionSuggestionShown),
+    wasCompressed: Boolean(entry?.wasCompressed),
+    processingModelLabel: "",
+  };
+}
+
+async function restoreProcessedResultsIntoFiles(files) {
+  try {
+    const snapshot = await readProcessedResultsSnapshot();
+
+    if (!snapshot || !Array.isArray(snapshot.entries)) {
+      return;
+    }
+
+    const resultEntries = new Map(snapshot.entries.map((entry) => [entry.imageId, entry]));
+
+    files.forEach((fileEntry) => {
+      const resultEntry = resultEntries.get(fileEntry.id);
+
+      if (!resultEntry || !doesProcessedResultMatchFile(resultEntry, fileEntry)) {
+        return;
+      }
+
+      if (resultEntry.status === "done") {
+        const results = normalizeProcessedResults(resultEntry.results);
+
+        if (results.length === 0) {
+          return;
+        }
+
+        fileEntry.status = "done";
+        fileEntry.results = results;
+        fileEntry.error = "";
+        return;
+      }
+
+      if (resultEntry.status === "error") {
+        fileEntry.status = "error";
+        fileEntry.results = [];
+        fileEntry.error = resultEntry.error || "This image could not be processed.";
+      }
+    });
+  } catch (error) {
+    console.warn("Could not restore processed results.", error);
+  }
+}
+
+function normalizeProcessedResults(results) {
+  if (!Array.isArray(results)) {
+    return [];
+  }
+
+  return results.map(normalizeItem).filter((item) => item.translatedText || item.originalText);
+}
+
+function doesProcessedResultMatchFile(resultEntry, fileEntry) {
+  return (
+    resultEntry.name === fileEntry.name &&
+    resultEntry.type === fileEntry.type &&
+    Number(resultEntry.originalSize) === Number(fileEntry.originalSize) &&
+    Number(resultEntry.workingSize) === Number(fileEntry.workingFile.size)
+  );
+}
+
+function normalizeRestoredPhotoFile(value, name, type) {
+  if (!(value instanceof Blob)) {
+    return null;
+  }
+
+  if (value instanceof File) {
+    return value;
+  }
+
+  return new File([value], name || "menu-image", { type: type || value.type || "image/jpeg" });
+}
+
+function scheduleUploadedPhotosSave() {
+  if (state.isRestoringPhotos) {
+    return;
+  }
+
+  if (state.photoSaveTimer) {
+    window.clearTimeout(state.photoSaveTimer);
+  }
+
+  state.photoSaveTimer = window.setTimeout(() => {
+    state.photoSaveTimer = 0;
+    saveUploadedPhotos();
+  }, PHOTO_STORAGE_SAVE_DELAY_MS);
+}
+
+function saveUploadedPhotos() {
+  if (state.isRestoringPhotos) {
+    return Promise.resolve();
+  }
+
+  if (state.photoSaveTimer) {
+    window.clearTimeout(state.photoSaveTimer);
+    state.photoSaveTimer = 0;
+  }
+
+  state.photoSavePromise = state.photoSavePromise.catch(() => null).then(saveUploadedPhotosNow);
+  return state.photoSavePromise;
+}
+
+function flushUploadedPhotosBeforeUnload() {
+  writeUploadedPhotoSessionSnapshotSync();
+  saveUploadedPhotos();
+  saveProcessedResults();
+  saveCartSnapshot();
+}
+
+async function saveUploadedPhotosNow() {
+  try {
+    if (state.files.length === 0) {
+      await deleteUploadedPhotoSnapshot();
+      state.photoSaveFailed = false;
+      return;
+    }
+
+    const snapshot = createUploadedPhotoSnapshot();
+    const saveResults = await Promise.allSettled([
+      withPhotoStorageTimeout(writeUploadedPhotoSnapshotRecord(snapshot)),
+      writeUploadedPhotoSessionSnapshot(snapshot),
+    ]);
+
+    if (saveResults.every((result) => result.status === "rejected")) {
+      throw saveResults[0].reason;
+    }
+
+    state.photoSaveFailed = false;
+  } catch (error) {
+    if (!state.photoSaveFailed) {
+      state.photoSaveFailed = true;
+      console.warn("Could not preserve uploaded photos.", error);
+      setStatus("This browser could not preserve uploaded photos for reload.", "error");
+    }
+  }
+}
+
+function clearUploadedPhotoSnapshot() {
+  if (state.photoSaveTimer) {
+    window.clearTimeout(state.photoSaveTimer);
+    state.photoSaveTimer = 0;
+  }
+
+  state.photoSavePromise = state.photoSavePromise
+    .catch(() => null)
+    .then(deleteUploadedPhotoSnapshot)
+    .then(() => {
+      state.photoSaveFailed = false;
+    })
+    .catch((error) => {
+      console.warn("Could not clear uploaded photo snapshot.", error);
+    });
+  deleteProcessedResultsSnapshot().catch((error) => {
+    console.warn("Could not clear processed results snapshot.", error);
+  });
+  deleteCartSnapshot().catch((error) => {
+    console.warn("Could not clear cart snapshot.", error);
+  });
+}
+
+function createUploadedPhotoSnapshot() {
+  return {
+    id: PHOTO_STORAGE_RECORD_ID,
+    savedAt: Date.now(),
+    activeImageId: state.activeImageId,
+    files: state.files.map(serializeUploadedPhotoEntry),
+  };
+}
+
+function serializeUploadedPhotoEntry(entry) {
+  return {
+    id: entry.id,
+    name: entry.name,
+    type: entry.type,
+    originalSize: entry.originalSize,
+    workingFile: entry.workingFile,
+    shouldSuggestCompression: Boolean(entry.shouldSuggestCompression),
+    compressionSuggestionShown: Boolean(entry.compressionSuggestionShown),
+    wasCompressed: Boolean(entry.wasCompressed),
+  };
+}
+
+async function serializeUploadedPhotoSessionEntry(entry) {
+  return {
+    ...entry,
+    workingFile: undefined,
+    workingFileDataUrl: await fileToDataUrl(entry.workingFile),
+  };
+}
+
+async function readUploadedPhotoSnapshots() {
+  const results = await Promise.allSettled([
+    withPhotoStorageTimeout(readUploadedPhotoSnapshotRecord()),
+    Promise.resolve().then(readUploadedPhotoSessionSnapshot),
+  ]);
+  const snapshots = results
+    .filter((result) => result.status === "fulfilled" && result.value)
+    .map((result) => result.value)
+    .sort((a, b) => (Number(b.savedAt) || 0) - (Number(a.savedAt) || 0));
+
+  if (snapshots.length > 0) {
+    return snapshots;
+  }
+
+  const errors = results.filter((result) => result.status === "rejected");
+
+  if (errors.length === results.length) {
+    throw errors[0].reason;
+  }
+
+  return [];
+}
+
+function readUploadedPhotoSnapshotRecord() {
+  return withPhotoStorageStore("readonly", (store) => store.get(PHOTO_STORAGE_RECORD_ID));
+}
+
+function writeUploadedPhotoSnapshotRecord(snapshot) {
+  return withPhotoStorageStore("readwrite", (store) => store.put(snapshot));
+}
+
+function deleteUploadedPhotoSnapshotRecord() {
+  return withPhotoStorageStore("readwrite", (store) => store.delete(PHOTO_STORAGE_RECORD_ID));
+}
+
+async function writeUploadedPhotoSessionSnapshot(snapshot) {
+  const sessionSnapshot = {
+    ...snapshot,
+    files: await Promise.all(snapshot.files.map(serializeUploadedPhotoSessionEntry)),
+  };
+
+  sessionStorage.setItem(PHOTO_SESSION_STORAGE_KEY, JSON.stringify(sessionSnapshot));
+}
+
+function writeUploadedPhotoSessionSnapshotSync() {
+  if (state.isRestoringPhotos || state.files.length === 0) {
+    return false;
+  }
+
+  try {
+    const snapshot = createUploadedPhotoSnapshot();
+    const files = [];
+
+    for (const entry of snapshot.files) {
+      const dataUrl = photoDataUrlCache.get(entry.workingFile);
+
+      if (!dataUrl) {
+        return false;
+      }
+
+      files.push({
+        ...entry,
+        workingFile: undefined,
+        workingFileDataUrl: dataUrl,
+      });
+    }
+
+    sessionStorage.setItem(PHOTO_SESSION_STORAGE_KEY, JSON.stringify({ ...snapshot, files }));
+    return true;
+  } catch (error) {
+    console.warn("Could not preserve uploaded photos before unload.", error);
+    return false;
+  }
+}
+
+function readUploadedPhotoSessionSnapshot() {
+  const value = sessionStorage.getItem(PHOTO_SESSION_STORAGE_KEY);
+
+  if (!value) {
+    return null;
+  }
+
+  return JSON.parse(value);
+}
+
+function deleteUploadedPhotoSessionSnapshot() {
+  sessionStorage.removeItem(PHOTO_SESSION_STORAGE_KEY);
+}
+
+async function deleteUploadedPhotoSnapshot() {
+  const results = await Promise.allSettled([
+    withPhotoStorageTimeout(deleteUploadedPhotoSnapshotRecord()),
+    Promise.resolve().then(deleteUploadedPhotoSessionSnapshot),
+  ]);
+
+  if (results.every((result) => result.status === "rejected")) {
+    throw results[0].reason;
+  }
+}
+
+function createProcessedResultsSnapshot() {
+  return {
+    id: PROCESSED_RESULTS_RECORD_ID,
+    savedAt: Date.now(),
+    entries: state.files.map(serializeProcessedResultEntry).filter(Boolean),
+  };
+}
+
+function serializeProcessedResultEntry(entry) {
+  if (!RESTORABLE_RESULT_STATUSES.has(entry.status)) {
+    return null;
+  }
+
+  if (entry.status === "done" && entry.results.length === 0) {
+    return null;
+  }
+
+  return {
+    imageId: entry.id,
+    name: entry.name,
+    type: entry.type,
+    originalSize: entry.originalSize,
+    workingSize: entry.workingFile.size,
+    status: entry.status,
+    results: entry.status === "done" ? entry.results : [],
+    error: entry.status === "error" ? entry.error || "" : "",
+  };
+}
+
+async function saveProcessedResults() {
+  if (state.isRestoringPhotos) {
+    return;
+  }
+
+  const snapshot = createProcessedResultsSnapshot();
+
+  try {
+    const saveResults = await Promise.allSettled([
+      withPhotoStorageTimeout(writeProcessedResultsSnapshotRecord(snapshot)),
+      Promise.resolve().then(() => writeProcessedResultsSessionSnapshot(snapshot)),
+    ]);
+
+    if (saveResults.every((result) => result.status === "rejected")) {
+      throw saveResults[0].reason;
+    }
+  } catch (error) {
+    console.warn("Could not preserve processed results.", error);
+  }
+}
+
+async function readProcessedResultsSnapshot() {
+  const results = await Promise.allSettled([
+    withPhotoStorageTimeout(readProcessedResultsSnapshotRecord()),
+    Promise.resolve().then(readProcessedResultsSessionSnapshot),
+  ]);
+  const snapshots = results
+    .filter((result) => result.status === "fulfilled" && result.value)
+    .map((result) => result.value)
+    .sort((a, b) => (Number(b.savedAt) || 0) - (Number(a.savedAt) || 0));
+
+  return snapshots[0] || null;
+}
+
+function readProcessedResultsSnapshotRecord() {
+  return withPhotoStorageStore("readonly", (store) => store.get(PROCESSED_RESULTS_RECORD_ID));
+}
+
+function writeProcessedResultsSnapshotRecord(snapshot) {
+  return withPhotoStorageStore("readwrite", (store) => store.put(snapshot));
+}
+
+function deleteProcessedResultsSnapshotRecord() {
+  return withPhotoStorageStore("readwrite", (store) => store.delete(PROCESSED_RESULTS_RECORD_ID));
+}
+
+function writeProcessedResultsSessionSnapshot(snapshot) {
+  sessionStorage.setItem(PROCESSED_RESULTS_SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+}
+
+function readProcessedResultsSessionSnapshot() {
+  const value = sessionStorage.getItem(PROCESSED_RESULTS_SESSION_STORAGE_KEY);
+
+  if (!value) {
+    return null;
+  }
+
+  return JSON.parse(value);
+}
+
+function deleteProcessedResultsSessionSnapshot() {
+  sessionStorage.removeItem(PROCESSED_RESULTS_SESSION_STORAGE_KEY);
+}
+
+async function deleteProcessedResultsSnapshot() {
+  const results = await Promise.allSettled([
+    withPhotoStorageTimeout(deleteProcessedResultsSnapshotRecord()),
+    Promise.resolve().then(deleteProcessedResultsSessionSnapshot),
+  ]);
+
+  if (results.every((result) => result.status === "rejected")) {
+    throw results[0].reason;
+  }
+}
+
+async function restoreCartIntoState(files) {
+  try {
+    const snapshot = await readCartSnapshot();
+
+    if (!snapshot || !Array.isArray(snapshot.items)) {
+      return;
+    }
+
+    const entriesById = new Map(files.map((entry) => [entry.id, entry]));
+    state.cart = snapshot.items
+      .map((item) => restoreCartSnapshotItem(item, entriesById))
+      .filter(Boolean);
+  } catch (error) {
+    console.warn("Could not restore cart.", error);
+  }
+}
+
+function restoreCartSnapshotItem(item, entriesById) {
+  const imageId = item?.imageId || "";
+  const entry = entriesById.get(imageId);
+
+  if (!entry || entry.status !== "done") {
+    return null;
+  }
+
+  const matchingResult = entry.results.find((result) => createCartItemKey(result, imageId) === item.itemKey);
+
+  if (!matchingResult) {
+    return null;
+  }
+
+  const quantity = Math.max(1, Math.floor(Number(item.quantity) || 0));
+
+  return {
+    id: item.id || createId(),
+    imageId,
+    itemKey: item.itemKey,
+    originalText: matchingResult.originalText || item.originalText || "",
+    translatedText: matchingResult.translatedText || item.translatedText || "",
+    price: matchingResult.price || item.price || "",
+    quantity,
+  };
+}
+
+function createCartSnapshot() {
+  return {
+    id: CART_RECORD_ID,
+    savedAt: Date.now(),
+    items: state.cart.map(serializeCartSnapshotItem),
+  };
+}
+
+function serializeCartSnapshotItem(item) {
+  return {
+    id: item.id,
+    imageId: item.imageId,
+    itemKey: item.itemKey,
+    originalText: item.originalText,
+    translatedText: item.translatedText,
+    price: item.price,
+    quantity: item.quantity,
+  };
+}
+
+async function saveCartSnapshot() {
+  if (state.isRestoringPhotos) {
+    return;
+  }
+
+  const snapshot = createCartSnapshot();
+
+  try {
+    const saveResults = await Promise.allSettled([
+      withPhotoStorageTimeout(writeCartSnapshotRecord(snapshot)),
+      Promise.resolve().then(() => writeCartSessionSnapshot(snapshot)),
+    ]);
+
+    if (saveResults.every((result) => result.status === "rejected")) {
+      throw saveResults[0].reason;
+    }
+  } catch (error) {
+    console.warn("Could not preserve cart.", error);
+  }
+}
+
+async function readCartSnapshot() {
+  const results = await Promise.allSettled([
+    withPhotoStorageTimeout(readCartSnapshotRecord()),
+    Promise.resolve().then(readCartSessionSnapshot),
+  ]);
+  const snapshots = results
+    .filter((result) => result.status === "fulfilled" && result.value)
+    .map((result) => result.value)
+    .sort((a, b) => (Number(b.savedAt) || 0) - (Number(a.savedAt) || 0));
+
+  return snapshots[0] || null;
+}
+
+function readCartSnapshotRecord() {
+  return withPhotoStorageStore("readonly", (store) => store.get(CART_RECORD_ID));
+}
+
+function writeCartSnapshotRecord(snapshot) {
+  return withPhotoStorageStore("readwrite", (store) => store.put(snapshot));
+}
+
+function deleteCartSnapshotRecord() {
+  return withPhotoStorageStore("readwrite", (store) => store.delete(CART_RECORD_ID));
+}
+
+function writeCartSessionSnapshot(snapshot) {
+  sessionStorage.setItem(CART_SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+}
+
+function readCartSessionSnapshot() {
+  const value = sessionStorage.getItem(CART_SESSION_STORAGE_KEY);
+
+  if (!value) {
+    return null;
+  }
+
+  return JSON.parse(value);
+}
+
+function deleteCartSessionSnapshot() {
+  sessionStorage.removeItem(CART_SESSION_STORAGE_KEY);
+}
+
+async function deleteCartSnapshot() {
+  const results = await Promise.allSettled([
+    withPhotoStorageTimeout(deleteCartSnapshotRecord()),
+    Promise.resolve().then(deleteCartSessionSnapshot),
+  ]);
+
+  if (results.every((result) => result.status === "rejected")) {
+    throw results[0].reason;
+  }
+}
+
+function withPhotoStorageTimeout(promise) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      window.setTimeout(() => reject(new Error("Photo storage timed out.")), PHOTO_STORAGE_TIMEOUT_MS);
+    }),
+  ]);
+}
+
+async function withPhotoStorageStore(mode, operation) {
+  const db = await getPhotoStorageDb();
+
+  return new Promise((resolve, reject) => {
+    let request;
+    const transaction = db.transaction(PHOTO_STORAGE_STORE_NAME, mode);
+    const store = transaction.objectStore(PHOTO_STORAGE_STORE_NAME);
+
+    transaction.oncomplete = () => resolve(request?.result);
+    transaction.onerror = () => reject(transaction.error || request?.error || new Error("Photo storage failed."));
+    transaction.onabort = () => reject(transaction.error || request?.error || new Error("Photo storage was aborted."));
+
+    try {
+      request = operation(store);
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function getPhotoStorageDb() {
+  if (photoStorageDbPromise) {
+    return photoStorageDbPromise;
+  }
+
+  photoStorageDbPromise = new Promise((resolve, reject) => {
+    if (!("indexedDB" in window)) {
+      reject(new Error("IndexedDB is not available."));
+      return;
+    }
+
+    const request = indexedDB.open(PHOTO_STORAGE_DB_NAME, PHOTO_STORAGE_DB_VERSION);
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+
+      if (!db.objectStoreNames.contains(PHOTO_STORAGE_STORE_NAME)) {
+        db.createObjectStore(PHOTO_STORAGE_STORE_NAME, { keyPath: "id" });
+      }
+    };
+
+    request.onsuccess = () => {
+      const db = request.result;
+      db.addEventListener("versionchange", () => db.close());
+      resolve(db);
+    };
+
+    request.onerror = () => reject(request.error || new Error("Could not open photo storage."));
+    request.onblocked = () => reject(new Error("Photo storage is blocked."));
+  });
+
+  photoStorageDbPromise.catch(() => {
+    photoStorageDbPromise = null;
+  });
+
+  return photoStorageDbPromise;
 }
 
 async function compressUploadedImages(entries) {
@@ -670,6 +1392,7 @@ async function compressUploadedImages(entries) {
     renderResults();
     renderCart();
     updateOversizePanel();
+    saveProcessedResults();
 
     if (afterSize < beforeSize) {
       setStatus(`Compression saved ${formatBytes(beforeSize - afterSize)}. Run Analyze when you are ready.`, "success");
@@ -1209,6 +1932,7 @@ function addCartItem(item, imageId) {
   setStatus("Added to order.", "success");
   renderResults();
   renderCart();
+  saveCartSnapshot();
 }
 
 function removeOneCartItem(item, imageId) {
@@ -1228,6 +1952,7 @@ function removeOneCartItem(item, imageId) {
   setStatus("Removed from order.");
   renderResults();
   renderCart();
+  saveCartSnapshot();
 }
 
 function createCartItem(item, imageId, itemKey = createCartItemKey(item, imageId)) {
@@ -1265,6 +1990,7 @@ function removeCartEntriesForImages(imageIds) {
 
   state.cart = nextCart;
   renderCart();
+  saveCartSnapshot();
 }
 
 function updateCartQuantity(cartItemId, delta) {
@@ -1282,6 +2008,7 @@ function updateCartQuantity(cartItemId, delta) {
 
   renderResults();
   renderCart();
+  saveCartSnapshot();
 }
 
 function getCartItemCount() {
@@ -1660,6 +2387,7 @@ async function maybeSuggestCompression(entries) {
   largeEntries.forEach((entry) => {
     entry.compressionSuggestionShown = true;
   });
+  scheduleUploadedPhotosSave();
 
   const largestEntry = largeEntries.reduce((largest, entry) => {
     return entry.workingFile.size > largest.workingFile.size ? entry : largest;
@@ -1988,6 +2716,7 @@ async function analyzeImages({ entries, forceCompress }) {
     renderResults();
     renderCart();
     elements.oversizePanel.hidden = true;
+    await saveProcessedResults();
 
     let successCount = 0;
     let failedCount = 0;
@@ -2013,6 +2742,7 @@ async function analyzeImages({ entries, forceCompress }) {
         entry.results = await callGemini([entry], activeModel);
         entry.status = "done";
         successCount += 1;
+        await saveProcessedResults();
       } catch (error) {
         entry.results = [];
         entry.error = error.message || "This image could not be processed.";
@@ -2021,6 +2751,7 @@ async function analyzeImages({ entries, forceCompress }) {
         renderFiles();
         renderResults();
         renderCart();
+        await saveProcessedResults();
 
         const fallbackResult = await applyLiteForRun(entry, error);
 
@@ -2040,6 +2771,7 @@ async function analyzeImages({ entries, forceCompress }) {
       renderResults();
       renderCart();
       updateProgress((index + 1) / totalImages);
+      await saveProcessedResults();
     }
 
     const itemCount = state.results.length;
@@ -2100,11 +2832,13 @@ async function applyLiteForRun(entry, error) {
   try {
     entry.results = await callGemini([entry], FALLBACK_MODEL);
     entry.status = "done";
+    await saveProcessedResults();
     return { applied: true, success: true };
   } catch (fallbackError) {
     entry.results = [];
     entry.error = fallbackError.message || "Lite retry failed.";
     entry.status = "error";
+    await saveProcessedResults();
     return { applied: true, success: false };
   }
 }
@@ -2419,16 +3153,61 @@ function canvasToBlob(canvas, type, quality) {
 }
 
 function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
+  return fileToDataUrl(file).then((value) => {
+    const commaIndex = value.indexOf(",");
+    return commaIndex >= 0 ? value.slice(commaIndex + 1) : value;
+  });
+}
+
+function fileToDataUrl(file) {
+  if (photoDataUrlCache.has(file)) {
+    return Promise.resolve(photoDataUrlCache.get(file));
+  }
+
+  if (photoDataUrlPromiseCache.has(file)) {
+    return photoDataUrlPromiseCache.get(file);
+  }
+
+  const promise = new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
       const value = String(reader.result || "");
-      const commaIndex = value.indexOf(",");
-      resolve(commaIndex >= 0 ? value.slice(commaIndex + 1) : value);
+      photoDataUrlCache.set(file, value);
+      resolve(value);
     };
     reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
     reader.readAsDataURL(file);
   });
+
+  photoDataUrlPromiseCache.set(file, promise);
+
+  promise.catch(() => {
+    photoDataUrlPromiseCache.delete(file);
+  });
+
+  return promise;
+}
+
+function dataUrlToFile(dataUrl, name, type) {
+  const [header, data] = String(dataUrl || "").split(",");
+
+  if (!header || !data || !header.startsWith("data:")) {
+    return null;
+  }
+
+  try {
+    const mimeType = header.match(/^data:([^;]+)/)?.[1] || type || "application/octet-stream";
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+
+    return new File([bytes], name || "menu-image", { type: type || mimeType });
+  } catch {
+    return null;
+  }
 }
 
 function getTargetLanguageConfig() {
